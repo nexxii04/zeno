@@ -9,6 +9,8 @@ const art = @import("../index/art/tree.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const Value = @import("../types/value.zig").Value;
+const fs = @import("../fs_compat.zig");
+const io_compat = @import("../io_compat.zig");
 
 /// Snapshot file magic header used for format identification.
 const MAGIC = [4]u8{ 'Z', 'E', 'N', 'S' };
@@ -50,7 +52,7 @@ const LoadedShard = struct {
 
 /// Writes bytes directly to one file while accumulating a rolling CRC32.
 const CrcFileWriter = struct {
-    file: std.fs.File,
+    file: fs.File,
     hasher: std.hash.crc.Crc32,
 
     /// Initializes a CRC-aware file writer.
@@ -58,7 +60,7 @@ const CrcFileWriter = struct {
     /// Time Complexity: O(1).
     ///
     /// Allocator: Does not allocate.
-    fn init(file: std.fs.File) CrcFileWriter {
+    fn init(file: fs.File) CrcFileWriter {
         return .{
             .file = file,
             .hasher = std.hash.crc.Crc32.init(),
@@ -166,7 +168,7 @@ pub fn load(
     allocator: std.mem.Allocator,
     path: []const u8,
 ) !SnapshotLoadResult {
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const file = fs.cwd().openFile(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return error.FileNotFound,
         else => return err,
     };
@@ -185,7 +187,7 @@ pub fn load(
     const computed_crc = std.hash.crc.Crc32.hash(file_bytes[0..data_len]);
     if (stored_crc != computed_crc) return error.SnapshotCorrupted;
 
-    var stream = std.io.fixedBufferStream(file_bytes[0..data_len]);
+    var stream = io_compat.fixedBufferStream(file_bytes[0..data_len]);
     const reader = stream.reader();
 
     var magic: [4]u8 = undefined;
@@ -253,7 +255,7 @@ pub fn load(
             try value_buf.resize(allocator, value_len);
             reader.readNoEof(value_buf.items) catch return error.SnapshotCorrupted;
 
-            var value_stream = std.io.fixedBufferStream(value_buf.items);
+            var value_stream = io_compat.fixedBufferStream(value_buf.items);
             const decoded = codec.deserializeValue(value_stream.reader(), shard_allocator, 0) catch return error.SnapshotCorrupted;
             if (value_stream.pos != value_buf.items.len) return error.SnapshotCorrupted;
             if (loaded_shard.tree.lookup(key) != null) return error.SnapshotCorrupted;
@@ -328,13 +330,13 @@ fn writeSnapshotFile(
     const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
     defer allocator.free(tmp_path);
 
-    if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+    if (fs.path.dirname(path)) |dir_path| {
+        if (dir_path.len != 0) try fs.cwd().makePath(dir_path);
     }
 
-    const tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+    const tmp_file = try fs.cwd().createFile(tmp_path, .{ .truncate = true });
     defer tmp_file.close();
-    errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+    errdefer fs.cwd().deleteFile(tmp_path) catch {};
 
     var writer = CrcFileWriter.init(tmp_file);
     var value_buf = std.ArrayList(u8).empty;
@@ -354,8 +356,8 @@ fn writeSnapshotFile(
     var crc_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, &crc_buf, writer.final(), .little);
     try tmp_file.writeAll(&crc_buf);
-    try std.posix.fsync(tmp_file.handle);
-    try std.fs.cwd().rename(tmp_path, path);
+    try fs.fsync(tmp_file.handle);
+    try fs.cwd().rename(tmp_path, path);
 
     return .{
         .checkpoint_lsn = checkpoint_lsn,
@@ -545,7 +547,7 @@ fn allocTmpPathTest(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basen
 ///
 /// Ownership: Caller owns the returned slice.
 fn readAllTest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try fs.cwd().openFile(path, .{});
     defer file.close();
     const file_size_u64 = try file.getEndPos();
     const file_size = std.math.cast(usize, file_size_u64) orelse return error.OutOfMemory;
@@ -558,7 +560,7 @@ fn readAllTest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
 ///
 /// Allocator: Does not allocate.
 fn xorByteTest(path: []const u8, offset: u64, mask: u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer file.close();
 
     try file.seekTo(offset);
@@ -577,7 +579,7 @@ fn xorByteTest(path: []const u8, offset: u64, mask: u8) !void {
 ///
 /// Ownership: Borrows `payload` for the duration of the rewrite only.
 fn writeSnapshotPayloadWithCrcTest(path: []const u8, payload: []const u8) !void {
-    const file = try std.fs.cwd().createFile(path, .{ .truncate = true });
+    const file = try fs.cwd().createFile(path, .{ .truncate = true });
     defer file.close();
 
     try file.writeAll(payload);
@@ -877,7 +879,7 @@ test "snapshot load rejects malformed lengths and truncated payloads" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(truncated_path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(truncated_path, .{ .mode = .read_write });
         defer file.close();
         const size = try file.getEndPos();
         try file.setEndPos(size - 5);

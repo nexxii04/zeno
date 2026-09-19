@@ -780,7 +780,7 @@ pub const Node4 = struct {
 /// Memory Footprint: 128 bytes (24 byte header + 16 bytes keys + 128 bytes children + padding).
 pub const Node16 = struct {
     header: NodeHeader,
-    keys: @Vector(16, u8) = @splat(0),
+    keys: [16]u8 = [_]u8{0} ** 16,
     children: [16]Node = undefined,
 
     /// Initializes a new, empty Node16 with the correct NodeType header.
@@ -796,17 +796,9 @@ pub const Node16 = struct {
     /// Time Complexity: O(1) due to fixed size.
     /// Allocator: Does not allocate.
     pub fn findChild(self: *const Node16, key_byte: u8) ?*Node {
-        const mask: @Vector(16, u8) = @splat(key_byte);
-        const match_mask = @as(u16, @bitCast(self.keys == mask));
         const n = @atomicLoad(u16, &self.header.num_children, .acquire);
-        const valid_mask = @as(u16, @intCast((@as(u32, 1) << @as(u5, @intCast(n))) - 1));
-        const bitmask = match_mask & valid_mask;
-
-        if (bitmask != 0) {
-            const index = @ctz(bitmask);
-            if (index < n) {
-                return @constCast(&self.children[index]);
-            }
+        for (0..n) |i| {
+            if (self.keys[i] == key_byte) return @constCast(&self.children[i]);
         }
         return null;
     }

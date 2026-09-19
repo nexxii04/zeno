@@ -2,11 +2,11 @@
 //! Cost: O(1) lock coordination per acquire or release call.
 //! Allocator: Does not allocate.
 
-const std = @import("std");
+const sync = @import("../sync.zig");
 
 /// Global reader-visible commit gate used to coordinate covered reads and batch visibility.
 pub const VisibilityGate = struct {
-    lock: std.Thread.RwLock = .{},
+    lock: sync.RwLock = .{},
 
     /// Acquires shared visibility access for read-side coordination.
     ///

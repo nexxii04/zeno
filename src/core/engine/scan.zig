@@ -231,7 +231,7 @@ fn addHeadOrFree(
     heap: *std.PriorityQueue(ShardHead, void, shardHeadOrder),
     head: ShardHead,
 ) error_mod.EngineError!void {
-    heap.add(head) catch |err| {
+    heap.push(allocator, head) catch |err| {
         freeEntry(allocator, head.entry);
         return err;
     };
@@ -257,10 +257,10 @@ fn mergePageFromShards(
 
     try page.entries.ensureTotalCapacity(allocator, limit);
 
-    var heap = std.PriorityQueue(ShardHead, void, shardHeadOrder).init(allocator, {});
+    var heap = std.PriorityQueue(ShardHead, void, shardHeadOrder).initContext({});
     defer {
-        while (heap.removeOrNull()) |head| freeEntry(allocator, head.entry);
-        heap.deinit();
+        while (heap.pop()) |head| freeEntry(allocator, head.entry);
+        heap.deinit(allocator);
     }
 
     var prefix_scratch = std.ArrayList(art.ScanEntry).empty;
@@ -283,7 +283,7 @@ fn mergePageFromShards(
     var last_emitted_key: ?[]const u8 = null;
 
     while (page.entries.items.len < limit) {
-        const head = heap.removeOrNull() orelse break;
+        const head = heap.pop() orelse break;
         page.entries.appendAssumeCapacity(head.entry);
         last_emitted_key = head.entry.key;
 
@@ -485,7 +485,7 @@ pub fn scanPrefix(
     prefix: []const u8,
 ) error_mod.EngineError!types.ScanResult {
     state.lockAllShardsShared();
-    
+
     defer state.unlockAllShardsShared();
     const now = runtime_shard.unixNow();
     state.recordOperation(.scan, 1);
@@ -508,7 +508,7 @@ pub fn scanRange(
     range: types.KeyRange,
 ) error_mod.EngineError!types.ScanResult {
     state.lockAllShardsShared();
-    
+
     defer state.unlockAllShardsShared();
     const now = runtime_shard.unixNow();
     state.recordOperation(.scan, 1);
@@ -519,7 +519,6 @@ pub fn scanRange(
         .allocator = allocator,
     };
 }
-
 
 /// Scans one prefix page inside a consistent read view.
 ///

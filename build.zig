@@ -27,11 +27,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run zeno-core tests");
     test_step.dependOn(&run_module_tests.step);
 
-    const zbench_dep = b.dependency("zbench", .{
-        .target = target,
-        .optimize = optimize,
-    });
-
     const bench_zeno_options = b.addOptions();
     bench_zeno_options.addOption(bool, "expose_internals", true);
     const bench_zeno_module = b.createModule(.{
@@ -50,7 +45,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
     bench_exe.root_module.addImport("zeno", bench_zeno_module);
-    bench_exe.root_module.addImport("zbench", zbench_dep.module("zbench"));
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run zeno-core benchmarks");

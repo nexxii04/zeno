@@ -3,6 +3,7 @@
 //! Allocator: Does not allocate.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const runtime_visibility = @import("../runtime/visibility.zig");
 
 const ReadViewCounter = std.atomic.Value(usize);
@@ -15,7 +16,7 @@ const ReadViewToken = struct {
 };
 
 var next_read_view_token_id = std.atomic.Value(u64).init(1);
-var read_view_tokens_mutex: std.Thread.Mutex = .{};
+var read_view_tokens_mutex: sync.Mutex = .{};
 var read_view_tokens = std.AutoHashMapUnmanaged(u64, ReadViewToken){};
 
 /// Registers one active read-view token for a borrowed runtime-state handle.

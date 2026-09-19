@@ -3,6 +3,7 @@
 //! Allocator: Uses explicit allocators for planning scratch, committed delta arenas, and temporary WAL batch views.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
 const builtin = @import("builtin");
 const art = @import("../index/art/tree.zig");
 const art_node = @import("../index/art/node.zig");
@@ -270,7 +271,7 @@ fn maybePauseAfterVisibilityGate() void {
     }
 
     while (!resume_after_visibility_gate.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        sync.sleep(100 * std.time.ns_per_us);
     }
 }
 
