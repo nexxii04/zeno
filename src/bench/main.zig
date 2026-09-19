@@ -3,7 +3,6 @@
 //! Allocator: Uses the benchmark-provided allocator for caller-owned result teardown and a process-wide page allocator for steady-state engine fixtures.
 
 const std = @import("std");
-const zbench = @import("zbench");
 const zeno = @import("zeno");
 
 const engine = zeno.public;
@@ -11,6 +10,20 @@ const official = zeno.official;
 const types = zeno.types;
 const internal = zeno.testing_internal;
 const FailingAllocator = std.testing.FailingAllocator;
+const DebugAllocator = std.heap.DebugAllocator(.{});
+
+const BenchTimer = struct {
+    started: i96,
+
+    fn start() BenchTimer {
+        return .{ .started = std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds };
+    }
+
+    fn read(self: BenchTimer) u64 {
+        const now = std.Io.Timestamp.now(std.Options.debug_io, .awake).nanoseconds;
+        return @intCast(@max(now - self.started, 0));
+    }
+};
 
 const scan_item_count: usize = 256;
 const scan_large_item_count: usize = 4096;
@@ -78,6 +91,73 @@ const BenchCliConfig = struct {
     scan_candidate_profile: bool = false,
     heavy_overwrite_profile: bool = false,
     metrics_config: types.MetricsConfig = types.defaultMetricsConfig(),
+};
+
+const LocalBenchmark = struct {
+    allocator: std.mem.Allocator,
+    max_iterations: usize,
+    time_budget_ns: u64,
+    benchmarks: std.ArrayList(Definition) = .empty,
+
+    const Definition = struct {
+        name: []const u8,
+        func: *const fn (ctx: *const anyopaque, allocator: std.mem.Allocator) void,
+        context: *const anyopaque,
+    };
+
+    fn init(allocator: std.mem.Allocator, max_iterations: usize, time_budget_ns: u64) LocalBenchmark {
+        return .{
+            .allocator = allocator,
+            .max_iterations = max_iterations,
+            .time_budget_ns = time_budget_ns,
+        };
+    }
+
+    fn deinit(self: *LocalBenchmark) void {
+        self.benchmarks.deinit(self.allocator);
+    }
+
+    fn addParam(self: *LocalBenchmark, name: []const u8, benchmark: anytype, _: anytype) !void {
+        const T: type = switch (@typeInfo(@TypeOf(benchmark))) {
+            .pointer => |ptr| if (ptr.is_const) ptr.child else @compileError(
+                "benchmark must be a const ptr to a struct with a 'run' method",
+            ),
+            else => @compileError(
+                "benchmark must be a const ptr to a struct with a 'run' method",
+            ),
+        };
+
+        _ = @as(fn (*T, std.mem.Allocator) void, T.run);
+        try self.benchmarks.append(self.allocator, .{
+            .name = name,
+            .func = @ptrCast(&T.run),
+            .context = @ptrCast(benchmark),
+        });
+    }
+
+    fn run(self: *LocalBenchmark, writer: anytype) !void {
+        try writer.print("{s: <32} {s: <12} {s: <16} {s: <16}\n", .{ "benchmark", "runs", "avg", "total" });
+        try writer.print("--------------------------------------------------------------\\n", .{});
+
+        for (self.benchmarks.items) |benchmark| {
+            var timer = BenchTimer.start();
+            var iterations: usize = 0;
+            while (iterations < self.max_iterations) {
+                benchmark.func(benchmark.context, self.allocator);
+                iterations += 1;
+                if (timer.read() >= self.time_budget_ns) break;
+            }
+
+            const total_ns = timer.read();
+            const avg_ns = if (iterations == 0) 0 else total_ns / iterations;
+            try writer.print("{s: <32} {d: <12} {d}ns {d}ns\n", .{
+                benchmark.name,
+                iterations,
+                avg_ns,
+                total_ns,
+            });
+        }
+    }
 };
 
 const default_sampled_latency_shift: u8 = 10;
@@ -462,14 +542,14 @@ const WalAppendGroupedBenchmark = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init) !void {
+    var gpa: DebugAllocator = .init;
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
     var stdout_buffer: [4 * 1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
-    const cli_config = try parseCliConfig(allocator);
+    var stdout = std.Io.File.stdout().writerStreaming(std.Options.debug_io, &stdout_buffer);
+    const cli_config = try parseCliConfig(init);
 
     if (cli_config.scan_allocation_profile) {
         try runScanAllocationProfile(&stdout.interface, cli_config.metrics_config);
@@ -732,7 +812,7 @@ fn runAndPrintThroughput(
 
     var total_elapsed: u128 = 0;
     for (0..iterations) |i| {
-        var op_timer = try std.time.Timer.start();
+        var op_timer = BenchTimer.start();
         func(allocator);
         const op_elapsed = op_timer.read();
         latencies[i] = op_elapsed;
@@ -798,7 +878,7 @@ const ScalingWorkerContext = struct {
 };
 
 fn scalingWorker(ctx: ScalingWorkerContext) void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: DebugAllocator = .init;
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -935,7 +1015,7 @@ fn runScalingForContention(
         var threads = try allocator.alloc(std.Thread, t_count);
         defer allocator.free(threads);
 
-        var timer = try std.time.Timer.start();
+        var timer = BenchTimer.start();
         for (0..t_count) |i| {
             const key = switch (contention) {
                 .none => maybe_worker_keys.?[i],
@@ -1005,9 +1085,8 @@ fn runScalingBenchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
     }
 }
 
-fn parseCliConfig(allocator: std.mem.Allocator) !BenchCliConfig {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
+fn parseCliConfig(init: std.process.Init) !BenchCliConfig {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
 
     var cli = BenchCliConfig{};
     var saw_metrics_mode = false;
@@ -1140,7 +1219,7 @@ fn formatBytesShort(buf: []u8, bytes: u64) ![]const u8 {
 fn profileHeavyOverwriteCase(compact_every_n: ?usize) !HeavyOverwriteProfile {
     const iterations: usize = 50_000;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa: DebugAllocator = .init;
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
@@ -1160,14 +1239,14 @@ fn profileHeavyOverwriteCase(compact_every_n: ?usize) !HeavyOverwriteProfile {
     var latencies = try allocator.alloc(u64, iterations);
     defer allocator.free(latencies);
 
-    var total_timer = try std.time.Timer.start();
+    var total_timer = BenchTimer.start();
     for (0..iterations) |i| {
         const key_index = i % put_overwrite_key_cardinality;
         const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index});
         @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast((key_index + i) % 26))));
         const value = types.Value{ .string = payload[0..] };
 
-        var op_timer = try std.time.Timer.start();
+        var op_timer = BenchTimer.start();
         try db.put(key, &value);
         latencies[i] = op_timer.read();
 
@@ -1270,14 +1349,14 @@ fn profileScanAllocations(
     comptime fixture_items: usize,
     mode: ScanProfileMode,
 ) !ScanAllocationProfile {
-    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var db_gpa: DebugAllocator = .init;
     defer std.debug.assert(db_gpa.deinit() == .ok);
 
     const db = try openBenchDb(db_gpa.allocator());
     defer db.close() catch unreachable;
     loadScanFixture(fixture_items, db);
 
-    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var result_gpa: DebugAllocator = .init;
     defer std.debug.assert(result_gpa.deinit() == .ok);
 
     var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
@@ -1316,20 +1395,20 @@ fn profileScanAllocations(
 }
 
 fn profilePublicFullScan(comptime fixture_items: usize) !ScanCandidateProfile {
-    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var db_gpa: DebugAllocator = .init;
     defer std.debug.assert(db_gpa.deinit() == .ok);
 
     const db = try openBenchDb(db_gpa.allocator());
     defer db.close() catch unreachable;
     loadScanFixture(fixture_items, db);
 
-    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var result_gpa: DebugAllocator = .init;
     defer std.debug.assert(result_gpa.deinit() == .ok);
 
     var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
     const counting_allocator = counting_state.allocator();
 
-    var timer = try std.time.Timer.start();
+    var timer = BenchTimer.start();
     var result = try db.scanPrefix(counting_allocator, "scan:");
     const elapsed_ns = timer.read();
 
@@ -1357,16 +1436,10 @@ fn runBenchSuite(
     try initSteadyStateBenches();
     defer deinitSteadyStateBenches();
 
-    var stable_bench = zbench.Benchmark.init(allocator, .{
-        .max_iterations = 8_192,
-        .time_budget_ns = 750 * std.time.ns_per_ms,
-    });
+    var stable_bench = LocalBenchmark.init(allocator, 8_192, 750 * std.time.ns_per_ms);
     defer stable_bench.deinit();
 
-    var growing_bench = zbench.Benchmark.init(allocator, .{
-        .max_iterations = 8_192,
-        .time_budget_ns = 750 * std.time.ns_per_ms,
-    });
+    var growing_bench = LocalBenchmark.init(allocator, 8_192, 750 * std.time.ns_per_ms);
     defer growing_bench.deinit();
 
     const put_fresh = PutFreshBenchmark{};
@@ -1539,7 +1612,8 @@ fn initSteadyStateBenches() !void {
     steady_art_tree = internal.art.Tree.init(std.heap.page_allocator);
     loadScanFixtureToArt(scan_item_count, &steady_art_tree.?);
 
-    wal_bench_path = try std.fmt.allocPrint(std.heap.page_allocator, "/tmp/zeno-bench-{d}.wal", .{std.time.timestamp()});
+    const wall_clock_ns = std.Io.Timestamp.now(std.Options.debug_io, .real).nanoseconds;
+    wal_bench_path = try std.fmt.allocPrint(std.heap.page_allocator, "/tmp/zeno-bench-{d}.wal", .{wall_clock_ns});
     steady_wal = try internal.wal.Wal.open(wal_bench_path.?, .{ .fsync_mode = .batched_async }, .{
         .ctx = undefined,
         .put = struct {
@@ -1575,7 +1649,7 @@ fn deinitSteadyStateBenches() void {
     if (steady_wal) |*wal| {
         wal.close();
         if (wal_bench_path) |path| {
-            std.fs.cwd().deleteFile(path) catch {};
+            std.Io.Dir.cwd().deleteFile(std.Options.debug_io, path) catch {};
             std.heap.page_allocator.free(path);
         }
         steady_wal = null;

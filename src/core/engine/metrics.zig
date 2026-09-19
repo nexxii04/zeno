@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const runtime_state = @import("../runtime/state.zig");
+const sync = @import("../sync.zig");
 
 /// Runs one engine-boundary operation and records one latency sample against `state`.
 ///
@@ -20,7 +21,7 @@ pub fn callWithLatency(
     if (!state.shouldRecordLatency()) {
         return @call(.auto, operation, args);
     }
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = sync.Timer.start();
     defer state.recordLatencySample(timer.read());
     return @call(.auto, operation, args);
 }
@@ -44,7 +45,7 @@ pub fn callWithOptionalLatency(
     } else {
         return @call(.auto, operation, args);
     }
-    var timer = std.time.Timer.start() catch unreachable;
+    var timer = sync.Timer.start();
     defer if (state) |resolved_state| {
         resolved_state.recordLatencySample(timer.read());
     };

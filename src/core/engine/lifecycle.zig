@@ -12,6 +12,8 @@ const runtime_state = @import("../runtime/state.zig");
 const storage_snapshot = @import("../storage/snapshot.zig");
 const storage_wal = @import("../storage/wal.zig");
 const runtime_shard = @import("../runtime/shard.zig");
+const sync = @import("../sync.zig");
+const fs = @import("../fs_compat.zig");
 const types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -147,7 +149,7 @@ pub fn close(db: *Database) EngineError!void {
 ///
 /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle. Writers and new readers are blocked globally during the brief checkpoint barrier, active `ReadView` handles holding the shared visibility gate cause one fail-fast `error.CheckpointBusy` response instead of waiting, and writers are blocked globally again during each shard-serialization window.
 pub fn checkpoint(db: *Database) EngineError!void {
-    var checkpoint_timer = std.time.Timer.start() catch unreachable;
+    var checkpoint_timer = sync.Timer.start();
     const snapshot_path = db.state.snapshot_path orelse return error.NoSnapshotPath;
 
     notifyCheckpointBarrierAttemptForTest();
@@ -339,7 +341,7 @@ fn notifyCheckpointBarrierAcquiredForTest() void {
 /// Allocator: Does not allocate.
 fn walFileHasContent(wal_path: ?[]const u8) bool {
     const path = wal_path orelse return false;
-    const file = std.fs.cwd().openFile(path, .{}) catch return false;
+    const file = fs.cwd().openFile(path, .{}) catch return false;
     defer file.close();
 
     const size = file.getEndPos() catch return false;
@@ -522,12 +524,12 @@ test "load_snapshot_for_open records corruption fallback when replayable wal exi
     }
 
     {
-        const wal_file = try std.fs.cwd().createFile(wal_path, .{ .truncate = true });
+        const wal_file = try fs.cwd().createFile(wal_path, .{ .truncate = true });
         defer wal_file.close();
         try wal_file.writeAll("wal");
     }
 
-    const file = try std.fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
     defer file.close();
     try file.writeAll("bad!");
 
@@ -561,12 +563,12 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     }
 
     {
-        const wal_file = try std.fs.cwd().createFile(empty_wal_path, .{ .truncate = true });
+        const wal_file = try fs.cwd().createFile(empty_wal_path, .{ .truncate = true });
         wal_file.close();
     }
 
     {
-        const file = try std.fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
         defer file.close();
         try file.writeAll("bad!");
     }

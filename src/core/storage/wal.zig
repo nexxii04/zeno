@@ -8,6 +8,9 @@ const builtin = @import("builtin");
 const codec = @import("../internal/codec.zig");
 const storage_replay = @import("replay.zig");
 const Value = @import("../types/value.zig").Value;
+const sync = @import("../sync.zig");
+const fs = @import("../fs_compat.zig");
+const fsyncFile = fs.fsync;
 
 /// Record tag for insert and update payload records.
 const tag_put: u8 = 0x01;
@@ -87,8 +90,8 @@ pub const PutBatchWrite = struct {
 
 /// Shared mutable runtime state guarded by the WAL mutex and atomics.
 const FlushState = struct {
-    file: std.fs.File,
-    mutex: std.Thread.Mutex,
+    file: fs.File,
+    mutex: sync.Mutex,
     dirty: std.atomic.Value(bool),
     last_appended_lsn: std.atomic.Value(u64),
     last_fsync_lsn: std.atomic.Value(u64),
@@ -136,10 +139,10 @@ pub const Wal = struct {
         applier: anytype,
         allocator: std.mem.Allocator,
     ) !Wal {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try fs.cwd().makePath(dir_path);
         }
-        const file = try std.fs.cwd().createFile(path, .{
+        const file = try fs.cwd().createFile(path, .{
             .read = true,
             .truncate = false,
         });
@@ -407,11 +410,11 @@ pub const Wal = struct {
         const handle = blk: {
             self.state.mutex.lock();
             errdefer self.state.mutex.unlock();
-            const dup_fd = try std.posix.dup(self.state.file.handle);
+            const dup_fd = try fs.dup(self.state.file.handle);
             self.state.mutex.unlock();
             break :blk dup_fd;
         };
-        defer std.posix.close(handle);
+        defer std.Io.Threaded.closeFd(handle);
 
         try performFsync(handle);
 
@@ -450,19 +453,19 @@ pub const Wal = struct {
         defer self.allocator.free(tmp_path);
 
         const old_file = self.state.file;
-        var tmp_file = try std.fs.cwd().createFile(tmp_path, .{
+        var tmp_file = try fs.cwd().createFile(tmp_path, .{
             .read = true,
             .truncate = true,
         });
         var promoted_tmp_file = false;
         defer if (!promoted_tmp_file) tmp_file.close();
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+        errdefer fs.cwd().deleteFile(tmp_path) catch {};
 
         try storage_replay.compactUpToLsn(self.allocator, old_file, tmp_file, max_lsn_inclusive);
-        try std.posix.fsync(tmp_file.handle);
+        try fsyncFile(tmp_file.handle);
         try tmp_file.seekFromEnd(0);
 
-        try std.fs.cwd().rename(tmp_path, self.path);
+        try fs.cwd().rename(tmp_path, self.path);
         old_file.close();
         self.state.file = tmp_file;
         promoted_tmp_file = true;
@@ -690,7 +693,7 @@ pub fn open(
 fn flushThreadMain(state: *FlushState) void {
     const interval_ns = @max(@as(u64, state.fsync_interval_ms), 1) * std.time.ns_per_ms;
     while (!state.stop_flush_thread.load(.acquire)) {
-        std.Thread.sleep(interval_ns);
+        sync.sleep(interval_ns);
         if (state.stop_flush_thread.load(.acquire)) break;
         flushOnce(state) catch {};
     }
@@ -714,12 +717,12 @@ fn flushOnce(state: *FlushState) !void {
         }
 
         const target_lsn = state.last_appended_lsn.load(.acquire);
-        const dup_fd = try std.posix.dup(state.file.handle);
+        const dup_fd = try fs.dup(state.file.handle);
         state.dirty.store(false, .release);
         state.mutex.unlock();
         break :blk .{ .target_lsn = target_lsn, .dup_fd = dup_fd };
     };
-    defer std.posix.close(snapshot.dup_fd);
+    defer std.Io.Threaded.closeFd(snapshot.dup_fd);
 
     performFsync(snapshot.dup_fd) catch |err| {
         state.flush_error.store(1, .release);
@@ -854,7 +857,7 @@ var g_fail_next_fsync = std.atomic.Value(bool).init(false);
 /// Allocator: Does not allocate.
 ///
 /// Ownership: Borrows `bytes` for the duration of the write only.
-fn writeAllTracked(file: std.fs.File, bytes: []const u8) !void {
+fn writeAllTracked(file: fs.File, bytes: []const u8) !void {
     if (builtin.is_test and g_fail_next_write.swap(false, .acq_rel)) {
         return error.SimulatedWriteFailure;
     }
@@ -870,7 +873,7 @@ fn performFsync(fd: std.posix.fd_t) !void {
     if (builtin.is_test and g_fail_next_fsync.swap(false, .acq_rel)) {
         return error.SimulatedFsyncFailure;
     }
-    try std.posix.fsync(fd);
+    try fsyncFile(fd);
 }
 
 /// Exposes test-only fault injection hooks for WAL append and fsync paths.
@@ -908,7 +911,7 @@ pub const test_hooks = if (builtin.is_test) struct {
 ///
 /// Ownership: Caller owns the returned slice.
 fn readAllTest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
+    const file = try fs.cwd().openFile(path, .{});
     defer file.close();
     return try file.readToEndAlloc(allocator, 1 << 20);
 }
@@ -1096,7 +1099,7 @@ fn replayCollectorExpire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !
 /// Ownership: Borrows `key` and `value_bytes` for the duration of the call only.
 fn writeCraftedRecordTest(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: fs.File,
     lsn: u64,
     tag: u8,
     key: []const u8,
@@ -1154,7 +1157,7 @@ test "replay restores standalone put delete and expire records" {
         try wal.appendExpire("gamma", 123);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1223,7 +1226,7 @@ test "append_put_group writes standalone put records in order" {
         });
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1266,7 +1269,7 @@ test "replay restores committed put batch atomically and in order" {
         });
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1302,13 +1305,13 @@ test "replay truncates incomplete batch tails safely" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
         defer file.close();
         const size = try file.getEndPos();
         try file.setEndPos(size - 3);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1342,7 +1345,7 @@ test "replay truncates corrupt crc tails safely" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
         defer file.close();
         try file.seekTo(second_start);
         var byte: [1]u8 = undefined;
@@ -1352,7 +1355,7 @@ test "replay truncates corrupt crc tails safely" {
         try file.writeAll(&byte);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1375,10 +1378,10 @@ test "replay truncates invalid batch structures from the matching begin" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step7-invalid-batch.wal");
     defer testing.allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+    if (fs.path.dirname(path)) |dir_path| {
+        if (dir_path.len != 0) try fs.cwd().makePath(dir_path);
     }
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+    const file = try fs.cwd().createFile(path, .{ .read = true, .truncate = true });
     defer file.close();
 
     var put_buf = std.ArrayList(u8).empty;
@@ -1398,7 +1401,7 @@ test "replay truncates invalid batch structures from the matching begin" {
     try writeCraftedRecordTest(testing.allocator, file, 3, tag_put, "alpha", put_buf.items);
     try writeCraftedRecordTest(testing.allocator, file, 4, tag_batch_commit, "", &commit_payload);
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1436,7 +1439,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
     }
 
     {
-        const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
         defer replay_file.close();
 
         var collector = ReplayCollector.init(testing.allocator);
@@ -1451,7 +1454,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
     }
 
     {
-        const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
         defer replay_file.close();
 
         var collector = ReplayCollector.init(testing.allocator);
@@ -1529,7 +1532,7 @@ test "truncate_up_to_lsn drops standalone records at or below the cutoff" {
         try wal.truncateUpToLsn(1);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1566,7 +1569,7 @@ test "truncate_up_to_lsn keeps committed batches by commit lsn" {
         try wal.truncateUpToLsn(4);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1605,7 +1608,7 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
         defer file.close();
         const size = try file.getEndPos();
         try file.setEndPos(size - 2);
@@ -1617,7 +1620,7 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
         try wal.truncateUpToLsn(0);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1718,7 +1721,7 @@ test "replay decodes allocated string and object values for put records" {
         }
     };
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = Collector.init(testing.allocator);
@@ -1746,16 +1749,16 @@ test "replay truncates standalone records with partial key payloads safely" {
     defer testing.allocator.free(path);
 
     {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try fs.cwd().makePath(dir_path);
         }
-        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+        const file = try fs.cwd().createFile(path, .{ .read = true, .truncate = true });
         defer file.close();
         try writeCraftedRecordTest(testing.allocator, file, 1, tag_delete, "alpha", "");
         try file.setEndPos(4 + 8 + 1 + 2 + 3);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);
@@ -1782,17 +1785,17 @@ test "replay truncates standalone records with partial value payloads safely" {
     try codec.serializeValue(testing.allocator, &Value{ .string = "hello" }, &value_buf, 0);
 
     {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try fs.cwd().makePath(dir_path);
         }
-        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+        const file = try fs.cwd().createFile(path, .{ .read = true, .truncate = true });
         defer file.close();
         try writeCraftedRecordTest(testing.allocator, file, 1, tag_put, "alpha", value_buf.items);
         const size = try file.getEndPos();
         try file.setEndPos(size - 1);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const replay_file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer replay_file.close();
 
     var collector = ReplayCollector.init(testing.allocator);

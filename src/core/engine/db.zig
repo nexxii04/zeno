@@ -3,6 +3,8 @@
 //! Allocator: Uses explicit allocators to own the engine handle, runtime state, and caller-visible cloned values.
 
 const std = @import("std");
+const sync = @import("../sync.zig");
+const fs = @import("../fs_compat.zig");
 const batch_ops = @import("batch.zig");
 const error_mod = @import("error.zig");
 const expiration = @import("expiration.zig");
@@ -309,7 +311,7 @@ pub const Database = struct {
         const interval_ns = @as(u64, db.ttl_sweeper.interval_ms) * std.time.ns_per_ms;
 
         while (!db.ttl_sweeper.stop.load(.acquire)) {
-            std.Thread.sleep(interval_ns);
+            sync.sleep(interval_ns);
             if (db.ttl_sweeper.stop.load(.acquire)) break;
 
             for (0..runtime_state.NUM_SHARDS) |shard_idx| {
@@ -660,7 +662,7 @@ fn currentCheckpointLsnForTest(db: *Database) u64 {
 }
 
 fn corruptFileByteForTest(path: []const u8, offset: u64, mask: u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    const file = try fs.cwd().openFile(path, .{ .mode = .read_write });
     defer file.close();
 
     try file.seekTo(offset);
@@ -965,7 +967,7 @@ test "corrupted snapshot with empty wal returns snapshot corrupted" {
     }
 
     {
-        const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = true });
+        const file = try fs.cwd().createFile(wal_path, .{ .truncate = true });
         file.close();
     }
     try corruptFileByteForTest(snapshot_path, 0, 0xff);
@@ -1507,7 +1509,7 @@ test "recovered expired ttl metadata remains invisible after wal-only restart" {
         try testing.expect(try db.expireAt("alpha", runtime_shard.unixNow() + 1));
     }
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    sync.sleep(1100 * std.time.ns_per_ms);
 
     const reopened = try open(testing.allocator, .{
         .wal_path = wal_path,
@@ -1548,7 +1550,7 @@ test "truncated batch tail does not become visible after wal-only reopen" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        const file = try fs.cwd().openFile(wal_path, .{ .mode = .read_write });
         defer file.close();
         const size = try file.getEndPos();
         try file.setEndPos(size - 1);
@@ -2611,7 +2613,7 @@ test "read view freezes expiration time at open" {
     var view = try db.readView();
     defer view.deinit();
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    sync.sleep(1100 * std.time.ns_per_ms);
 
     var in_view = try scanPrefixFromInView(&view, testing.allocator, "alpha", null, 10);
     defer in_view.deinit();
@@ -2636,7 +2638,7 @@ test "ttl does not deadlock under an active read view and defers cleanup" {
     var view = try db.readView();
     defer view.deinit();
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    sync.sleep(1100 * std.time.ns_per_ms);
 
     try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:view"));
     try testing.expect(hasTtlForTest(db, "ttl:view"));
@@ -2935,10 +2937,10 @@ test "batch visibility-gate pause hook blocks completion until resumed" {
             pause_seen = true;
             break;
         }
-        std.Thread.sleep(std.time.ns_per_ms);
+        sync.sleep(std.time.ns_per_ms);
     }
     try testing.expect(pause_seen);
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    sync.sleep(20 * std.time.ns_per_ms);
     try testing.expect(!batch_state.finished.load(.acquire));
 
     batch_ops.test_hooks.resumeBatchAfterVisibilityGate();
@@ -2949,7 +2951,7 @@ test "batch visibility-gate pause hook blocks completion until resumed" {
             completed = true;
             break;
         }
-        std.Thread.sleep(std.time.ns_per_ms);
+        sync.sleep(std.time.ns_per_ms);
     }
     batch_thread.join();
 
@@ -3311,7 +3313,7 @@ test "ttl_sweep_interval_ms starts background cleanup of expired keys" {
     try setTtlForTest(db, "sweep:bg", runtime_shard.unixNow() - 1);
 
     // Wait for at least two sweep cycles
-    std.Thread.sleep(80 * std.time.ns_per_ms);
+    sync.sleep(80 * std.time.ns_per_ms);
 
     try testing.expect(!hasStoredKeyForTest(db, "sweep:bg"));
     try testing.expect(!hasTtlForTest(db, "sweep:bg"));

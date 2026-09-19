@@ -6,6 +6,7 @@ const std = @import("std");
 const art = @import("../index/art/tree.zig");
 const art_node = @import("../index/art/node.zig");
 const runtime_visibility = @import("visibility.zig");
+const sync = @import("../sync.zig");
 
 /// Number of shards in the runtime execution state.
 pub const NUM_SHARDS: usize = 256;
@@ -49,7 +50,7 @@ pub fn getShardIndex(key: []const u8) usize {
 ///
 /// Allocator: Does not allocate.
 pub fn unixNow() i64 {
-    return std.time.timestamp();
+    return std.Io.Timestamp.now(std.Options.debug_io, .real).toSeconds();
 }
 
 /// One committed batch delta arena linked into shard lifetime after a successful apply.
@@ -60,7 +61,7 @@ pub const CommittedArena = struct {
 
 /// One shard of runtime state owned by the engine.
 pub const Shard = struct {
-    lock: std.Thread.RwLock align(64) = .{},
+    lock: sync.RwLock align(64) = .{},
     visibility_gate: runtime_visibility.VisibilityGate align(64) = .{},
     seq: std.atomic.Value(u64) align(64) = .init(0),
     base_allocator: std.mem.Allocator,

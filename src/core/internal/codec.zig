@@ -176,7 +176,8 @@ test "serialize_value and deserialize_value roundtrip nested payloads" {
     const original = Value{ .object = nested };
     try serializeValue(allocator, &original, &buf, 0);
 
-    var stream = std.io.fixedBufferStream(buf.items);
+    const io_compat = @import("../io_compat.zig");
+    var stream = io_compat.fixedBufferStream(buf.items);
     var decoded = try deserializeValue(stream.reader(), allocator, 0);
     defer decoded.deinit(allocator);
 

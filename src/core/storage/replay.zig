@@ -6,6 +6,8 @@
 const std = @import("std");
 const codec = @import("../internal/codec.zig");
 const Value = @import("../types/value.zig").Value;
+const fs = @import("../fs_compat.zig");
+const io_compat = @import("../io_compat.zig");
 
 const tag_put: u8 = 0x01;
 const tag_delete: u8 = 0x02;
@@ -107,7 +109,7 @@ const ReplayBatchState = struct {
             .member_record_count = member_record_count,
             .seen_mutations = 0,
             .mode = mode,
-            .mutations = .{},
+            .mutations = .empty,
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -159,7 +161,7 @@ const CompactBatchState = struct {
 /// Ownership: Borrows `file` and the `applier` callbacks for the duration of the call only.
 ///
 /// Thread Safety: Not safe to call concurrently with WAL appends or other replay passes against the same file.
-pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File, min_lsn: u64) !ReplayResult {
+pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: fs.File, min_lsn: u64) !ReplayResult {
     try file.seekTo(0);
 
     var result = ReplayResult{
@@ -290,8 +292,8 @@ pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File,
 /// Ownership: Borrows `src_file` and `dst_file` for the duration of the rewrite only.
 pub fn compactUpToLsn(
     allocator: std.mem.Allocator,
-    src_file: std.fs.File,
-    dst_file: std.fs.File,
+    src_file: fs.File,
+    dst_file: fs.File,
     max_lsn_inclusive: u64,
 ) !void {
     try src_file.seekTo(0);
@@ -370,7 +372,7 @@ pub fn compactUpToLsn(
 /// Time Complexity: O(1) CPU work plus filesystem truncate latency.
 ///
 /// Allocator: Does not allocate.
-fn truncateAt(file: std.fs.File, offset: u64) !void {
+fn truncateAt(file: fs.File, offset: u64) !void {
     try file.setEndPos(offset);
     try file.seekTo(offset);
 }
@@ -403,7 +405,7 @@ fn maybeDropReplayScratch(
 ///
 /// Allocator: Resizes `buf` through its owned allocator; caller retains ownership of the copied bytes.
 fn loadRecordBytes(
-    file: std.fs.File,
+    file: fs.File,
     allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     start_offset: u64,
@@ -430,12 +432,12 @@ fn applyReplayMutation(
     decode_arena: *std.heap.ArenaAllocator,
     result: *ReplayResult,
     record: *const ScannedRecord,
-    file: std.fs.File,
+    file: fs.File,
     truncate_offset: u64,
 ) !bool {
     switch (record.payload) {
         .put => {
-            var fbs = std.io.fixedBufferStream(record.value);
+            var fbs = io_compat.fixedBufferStream(record.value);
             const decode_allocator = decode_arena.allocator();
             const value = codec.deserializeValue(fbs.reader(), decode_allocator, 0) catch |err| switch (err) {
                 error.MaxDepthExceeded, error.UnknownValueTag => {
@@ -467,7 +469,7 @@ fn applyBufferedBatch(
     allocator: std.mem.Allocator,
     result: *ReplayResult,
     batch: *const ReplayBatchState,
-    file: std.fs.File,
+    file: fs.File,
 ) !bool {
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
@@ -501,7 +503,7 @@ fn applyBufferedBatch(
 ///
 /// Ownership: Returned `key` and `value` slices borrow `key_buf` and `val_buf` storage until the next scan.
 fn scanNextRecord(
-    file: std.fs.File,
+    file: fs.File,
     allocator: std.mem.Allocator,
     key_buf: *std.ArrayList(u8),
     val_buf: *std.ArrayList(u8),
@@ -739,7 +741,7 @@ const ReadClass = enum {
 /// Allocator: Does not allocate.
 ///
 /// Ownership: Fills the caller-owned `buf` in place.
-fn readExactClassifiedFile(file: std.fs.File, buf: []u8) !ReadClass {
+fn readExactClassifiedFile(file: fs.File, buf: []u8) !ReadClass {
     if (buf.len == 0) return .ok;
     const read_count = try file.readAll(buf);
     if (read_count == 0) return .eof;
